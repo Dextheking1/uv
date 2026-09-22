@@ -11,7 +11,7 @@ pub use owo_colors;
 use rustc_hash::FxHashSet;
 #[doc(hidden)]
 pub use uv_errors::Hints;
-use uv_errors::{ErrorOptions, Stderr, write_error_chain_with_options};
+use uv_errors::{ErrorOptions, write_error_chain_with_options};
 
 /// Whether user-facing warnings are enabled.
 pub static ENABLED: AtomicBool = AtomicBool::new(false);
@@ -26,32 +26,79 @@ pub fn disable() {
     ENABLED.store(false, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// A callback function for printing warnings.
+type PrinterCallback = Box<dyn Fn(&str) + Send + Sync>;
+
+/// A global printer callback that, when set, is used to print warnings instead of writing
+/// directly to stderr. This allows coordinating warning output with indicatif's progress bar
+/// system via `MultiProgress::suspend()`, so active progress bars can't truncate warnings.
+/// See: <https://github.com/astral-sh/uv/issues/18626>.
+static PRINTER: Mutex<Option<PrinterCallback>> = Mutex::new(None);
+
+/// Set a global printer callback for warning output.
+///
+/// When set, all warnings are routed through this callback instead of writing directly
+/// to stderr. This is used to coordinate with indicatif progress bars.
+///
+/// Note: only one printer callback can be active at a time. If multiple reporters call
+/// `set_printer` concurrently, the last one wins and `clear_printer` from an earlier
+/// reporter will remove the later reporter's callback. Callers should ensure only one
+/// reporter is active at a time.
+pub fn set_printer(callback: PrinterCallback) {
+    if let Ok(mut printer) = PRINTER.lock() {
+        *printer = Some(callback);
+    }
+}
+
+/// Clear the global printer callback, restoring direct stderr output for warnings.
+pub fn clear_printer() {
+    if let Ok(mut printer) = PRINTER.lock() {
+        *printer = None;
+    }
+}
+
+/// Print a warning message, routing through the global printer callback if one is set,
+/// or falling back to writing directly to stderr.
+///
+/// The message is written as-is, and is expected to end with a newline.
+///
+/// Uses `try_lock()` instead of `lock()` to avoid deadlocking if the callback
+/// (or anything it transitively calls) triggers another warning on the same thread.
+#[doc(hidden)]
+pub fn print_warning(line: &str) {
+    if let Ok(printer) = PRINTER.try_lock() {
+        if let Some(callback) = printer.as_ref() {
+            callback(line);
+            return;
+        }
+    }
+    anstream::eprint!("{line}");
+}
+
 /// Format a warning chain to standard error.
 pub fn write_warning_chain(err: &dyn Error, hints: &Hints<'_>) -> fmt::Result {
-    write_warning_chain_with_options(err, hints, ErrorOptions::default())
-}
-
-/// Format a warning chain to standard error once, deduplicating the complete rendered chain and hints.
-pub fn write_warning_chain_once(err: &dyn Error, hints: &Hints<'_>) -> fmt::Result {
-    write_warning_chain_once_with_writer(err, hints, &WARNINGS, Stderr)
-}
-
-fn write_warning_chain_once_with_writer(
-    err: &dyn Error,
-    hints: &Hints<'_>,
-    warnings: &Mutex<FxHashSet<String>>,
-    mut writer: impl fmt::Write,
-) -> fmt::Result {
     let mut message = String::new();
     write_warning_chain_with_options(
         err,
         hints,
         ErrorOptions::default().with_stream(&mut message),
     )?;
-    if let Ok(mut warnings) = warnings.lock()
+    print_warning(&message);
+    Ok(())
+}
+
+/// Format a warning chain to standard error once, deduplicating the complete rendered chain and hints.
+pub fn write_warning_chain_once(err: &dyn Error, hints: &Hints<'_>) -> fmt::Result {
+    let mut message = String::new();
+    write_warning_chain_with_options(
+        err,
+        hints,
+        ErrorOptions::default().with_stream(&mut message),
+    )?;
+    if let Ok(mut warnings) = WARNINGS.lock()
         && warnings.insert(message.clone())
     {
-        writer.write_str(&message)?;
+        print_warning(&message);
     }
     Ok(())
 }
@@ -74,13 +121,13 @@ fn write_warning_chain_with_options<C, W: fmt::Write>(
 #[macro_export]
 macro_rules! warn_user {
     ($($arg:tt)*) => {{
-        use $crate::anstream::eprintln;
         use $crate::owo_colors::OwoColorize;
 
         if $crate::ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
             let message = format!("{}", format_args!($($arg)*));
             let formatted = message.bold();
-            eprintln!("{}{} {formatted}", "warning".yellow().bold(), ":".bold());
+            let line = format!("{}{} {formatted}\n", "warning".yellow().bold(), ":".bold());
+            $crate::print_warning(&line);
         }
     }};
 }
@@ -120,14 +167,14 @@ pub static WARNINGS: LazyLock<Mutex<FxHashSet<String>>> = LazyLock::new(Mutex::d
 #[macro_export]
 macro_rules! warn_user_once {
     ($($arg:tt)*) => {{
-        use $crate::anstream::eprintln;
         use $crate::owo_colors::OwoColorize;
 
         if $crate::ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
             if let Ok(mut states) = $crate::WARNINGS.lock() {
                 let message = format!("{}", format_args!($($arg)*));
                 if states.insert(message.clone()) {
-                    eprintln!("{}{} {}", "warning".yellow().bold(), ":".bold(), message.bold());
+                    let line = format!("{}{} {}\n", "warning".yellow().bold(), ":".bold(), message.bold());
+                    $crate::print_warning(&line);
                 }
             }
         }
@@ -153,14 +200,40 @@ macro_rules! warn_user_once_with_chain {
 
 #[cfg(test)]
 mod tests {
+    use std::error::Error;
     use std::fmt;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     use anyhow::anyhow;
     use insta::assert_snapshot;
+    use rustc_hash::FxHashSet;
     use uv_errors::{ErrorOptions, Hints};
 
-    use super::{disable, write_warning_chain_once_with_writer, write_warning_chain_with_options};
+    use super::{
+        clear_printer, disable, print_warning, set_printer, write_warning_chain_with_options,
+    };
+
+    /// Test-only variant of [`super::write_warning_chain_once`] that writes to an
+    /// in-memory writer instead of routing through the global printer.
+    fn write_warning_chain_once_with_writer(
+        err: &dyn Error,
+        hints: &Hints<'_>,
+        warnings: &Mutex<FxHashSet<String>>,
+        mut writer: impl fmt::Write,
+    ) -> fmt::Result {
+        let mut message = String::new();
+        write_warning_chain_with_options(
+            err,
+            hints,
+            ErrorOptions::default().with_stream(&mut message),
+        )?;
+        if let Ok(mut warnings) = warnings.lock()
+            && warnings.insert(message.clone())
+        {
+            writer.write_str(&message)?;
+        }
+        Ok(())
+    }
 
     #[test]
     fn format_warning_chain() {
@@ -275,5 +348,73 @@ mod tests {
         );
 
         assert_eq!(evaluations, 0);
+    }
+
+    /// Serializes tests that mutate the global printer callback, since tests
+    /// in the same binary run in parallel.
+    static PRINTER_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Collect lines passed through the global printer callback.
+    fn capture_printer() -> (Arc<Mutex<Vec<String>>>, impl FnOnce()) {
+        let captured: Arc<Mutex<Vec<String>>> = Arc::default();
+        let captured_clone = Arc::clone(&captured);
+        set_printer(Box::new(move |line: &str| {
+            captured_clone.lock().unwrap().push(line.to_string());
+        }));
+        let guard = || clear_printer();
+        (captured, guard)
+    }
+
+    #[test]
+    fn set_printer_routes_print_warning_through_callback() {
+        let _lock = PRINTER_TEST_LOCK.lock().unwrap();
+        let (captured, unguard) = capture_printer();
+        print_warning("warning: something happened\n");
+        unguard();
+
+        let captured = captured.lock().unwrap();
+        assert_eq!(*captured, ["warning: something happened\n"]);
+    }
+
+    #[test]
+    fn clear_printer_stops_routing_through_callback() {
+        let _lock = PRINTER_TEST_LOCK.lock().unwrap();
+        let (captured, unguard) = capture_printer();
+        unguard();
+        // With no printer set, `print_warning` falls back to writing directly
+        // to stderr, so the callback must not observe the message.
+        print_warning("warning: not captured\n");
+
+        let captured = captured.lock().unwrap();
+        assert!(captured.is_empty());
+    }
+
+    #[test]
+    fn set_printer_replaces_previous_callback() {
+        let _lock = PRINTER_TEST_LOCK.lock().unwrap();
+        let (first, unguard_first) = capture_printer();
+        let (second, unguard_second) = capture_printer();
+        print_warning("warning: latest wins\n");
+        unguard_first();
+        unguard_second();
+
+        assert!(first.lock().unwrap().is_empty());
+        assert_eq!(*second.lock().unwrap(), ["warning: latest wins\n"]);
+    }
+
+    #[test]
+    fn reentrant_print_warning_does_not_deadlock() {
+        let _lock = PRINTER_TEST_LOCK.lock().unwrap();
+        // If the callback transitively triggers another warning, `print_warning`
+        // must not deadlock on the printer lock; it falls back to stderr instead.
+        set_printer(Box::new(|line: &str| {
+            // The inner call cannot acquire the printer lock, so it writes
+            // directly to stderr rather than recursing.
+            if !line.contains("inner") {
+                print_warning("warning: inner\n");
+            }
+        }));
+        print_warning("warning: outer\n");
+        clear_printer();
     }
 }
